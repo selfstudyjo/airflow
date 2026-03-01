@@ -10,71 +10,69 @@ from airflow.models import Variable
 # Configuration
 # ------------------------------------------------------------
 APP_IDS = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+APP_NAMES = {
+    8: "SelfStudy Domains",
+    9: "SelfStudy Chat",
+    10: "All Chat",
+    11: "Lab",
+    12: "Live Course",
+    13: "User Profile",
+    14: "SelfStudy OTP",
+    15: "SelfStudy Auth",
+    16: "Notifications",
+    17: "Runbooks",
+    18: "SelfStudy Media",
+    19: "SelfStudy Course",
+    20: "Exam",
+    21: "Proctor",
+    22: "Subscriptions",
+    23: "Payment",
+    24: "Certificate"
+}
 DOMAINS = [
     "https://sfsdomains1.pythonanywhere.com",
     "https://sfsdomains2.pythonanywhere.com"
 ]
-POOL_NAME = "extend_pool"  # Create this pool with slots = 3-5
-MAX_CONCURRENT_TASKS = 5   # Airflow-wide limit for this DAG
+POOL_NAME = "extend_pool"          # Create this pool with 3-5 slots
+MAX_CONCURRENT_TASKS = 5           # Global limit for this DAG
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------
-# Task 1: Fetch all apps and their replicas
+# Task: Fetch replicas for a given app
 # ------------------------------------------------------------
 @task
-def fetch_all_apps_data():
+def fetch_replicas(app_id: int):
     """
-    Fetch data for all apps and return a list of app dictionaries.
-    Each app dict contains:
-        app_id, app_name, replicas (list of {username, password})
+    Fetch replicas for a specific app. Returns list of dicts with username, password.
     """
     auth_token = Variable.get("AUTH_TOKEN")
     headers = {
         'Authorization': f'Token {auth_token}',
         'Content-Type': 'application/json'
     }
-
-    apps_data = []
-    for app_id in APP_IDS:
-        app_info = None
-        for domain in DOMAINS:
-            url = f"{domain}/apps/{app_id}"
-            try:
-                logger.info(f"Fetching from {url}")
-                resp = requests.get(url, headers=headers, timeout=30)
-                resp.raise_for_status()
-                data = resp.json()
-                app_info = {
-                    'app_id': app_id,
-                    'app_name': data.get('app_name', f'App_{app_id}'),
-                    'replicas': [
-                        {
-                            'username': rep['replica_username'],
-                            'password': rep['replica_password']
-                        }
-                        for rep in data.get('replicas', [])
-                    ]
+    for domain in DOMAINS:
+        url = f"{domain}/apps/{app_id}"
+        try:
+            logger.info(f"Fetching from {url}")
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            replicas = [
+                {
+                    'username': rep['replica_username'],
+                    'password': rep['replica_password']
                 }
-                logger.info(f"App {app_id}: {len(app_info['replicas'])} replicas")
-                break  # Success, exit domain loop
-            except Exception as e:
-                logger.warning(f"Failed to fetch from {url}: {e}")
-                continue
-        if app_info is None:
-            logger.error(f"Could not fetch data for app {app_id} from any domain")
-            # Still add an entry with empty replicas to keep the list
-            app_info = {
-                'app_id': app_id,
-                'app_name': f'App_{app_id} (unavailable)',
-                'replicas': []
-            }
-        apps_data.append(app_info)
-
-    logger.info(f"Total apps fetched: {len(apps_data)}")
-    return apps_data
-
+                for rep in data.get('replicas', [])
+            ]
+            logger.info(f"App {app_id}: {len(replicas)} replicas")
+            return replicas
+        except Exception as e:
+            logger.warning(f"Failed to fetch from {url}: {e}")
+            continue
+    logger.error(f"Could not fetch data for app {app_id} from any domain")
+    return []  # return empty list so no tasks are created
 
 # ------------------------------------------------------------
 # Task: Extend a single replica (the actual Selenium work)
@@ -220,31 +218,6 @@ def extend_replica(replica: dict, app_name: str):
         if driver:
             driver.quit()
 
-
-# ------------------------------------------------------------
-# Task Group: Process one app (all its replicas)
-# ------------------------------------------------------------
-@task_group(group_id="process_app", prefix_group_id=False)
-def process_app(app_dict):
-    """
-    For a given app, create one child task per replica.
-    The group will be named after the app (app_name) in the UI.
-    """
-    app_name = app_dict['app_name']
-    replicas = app_dict['replicas']
-
-    # If no replicas, we still create a dummy task to show the group
-    if not replicas:
-        @task(task_id="no_replicas")
-        def no_op():
-            logger.info(f"App {app_name} has no replicas.")
-        no_op()
-        return
-
-    # Expand the extend_replica task over all replicas
-    extend_replica.partial(app_name=app_name).expand(replica=replicas)
-
-
 # ------------------------------------------------------------
 # DAG Definition
 # ------------------------------------------------------------
@@ -263,12 +236,22 @@ with DAG(
     schedule_interval=timedelta(weeks=1),
     catchup=False,
     tags=['pythonanywhere', 'professional'],
-    max_active_tasks=MAX_CONCURRENT_TASKS,   # Global limit for this DAG
+    max_active_tasks=MAX_CONCURRENT_TASKS,
 ) as dag:
 
-    # Fetch all apps data first
-    apps_data = fetch_all_apps_data()
+    # Create a task group for each app statically
+    for app_id in APP_IDS:
+        app_name = APP_NAMES.get(app_id, f"App_{app_id}")
+        # Sanitize group_id (remove spaces and special characters)
+        safe_name = app_name.replace(' ', '_').replace('-', '_')
+        group_id = f"app_{app_id}_{safe_name}"
 
-    # For each app, create a task group (dynamically)
-    # Using .expand() on the task group will create one group per app.
-    process_app.expand(app_dict=apps_data)
+        @task_group(group_id=group_id)
+        def app_group(app_id=app_id, app_name=app_name):
+            # Fetch replicas for this app
+            replicas = fetch_replicas(app_id)
+            # For each replica, create a task
+            extend_replica.partial(app_name=app_name).expand(replica=replicas)
+
+        # Instantiate the group in the DAG
+        app_group()
