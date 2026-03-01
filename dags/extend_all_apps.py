@@ -33,8 +33,9 @@ DOMAINS = [
     "https://sfsdomains1.pythonanywhere.com",
     "https://sfsdomains2.pythonanywhere.com"
 ]
-POOL_NAME = "extend_pool"          # Create this pool with 3-5 slots
-MAX_CONCURRENT_TASKS = 5           # Global limit for this DAG
+
+# Control concurrency: at most 5 Selenium tasks run simultaneously
+MAX_CONCURRENT_TASKS = 5
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ def fetch_replicas(app_id: int):
 # ------------------------------------------------------------
 # Task: Extend a single replica (the actual Selenium work)
 # ------------------------------------------------------------
-@task(pool=POOL_NAME)
+@task
 def extend_replica(replica: dict, app_name: str):
     """
     Perform the web app extension for one replica.
@@ -236,14 +237,15 @@ with DAG(
     schedule_interval=timedelta(weeks=1),
     catchup=False,
     tags=['pythonanywhere', 'professional'],
-    max_active_tasks=MAX_CONCURRENT_TASKS,
+    max_active_tasks=MAX_CONCURRENT_TASKS,          # Limits total running tasks in this DAG
+    max_active_runs=1,                               # Only one DAG run at a time
 ) as dag:
 
     # Create a task group for each app statically
     for app_id in APP_IDS:
         app_name = APP_NAMES.get(app_id, f"App_{app_id}")
-        # Sanitize group_id (remove spaces and special characters)
-        safe_name = app_name.replace(' ', '_').replace('-', '_')
+        # Sanitize group_id: replace spaces and hyphens with underscores
+        safe_name = app_name.replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '')
         group_id = f"app_{app_id}_{safe_name}"
 
         @task_group(group_id=group_id)
@@ -253,5 +255,5 @@ with DAG(
             # For each replica, create a task
             extend_replica.partial(app_name=app_name).expand(replica=replicas)
 
-        # Instantiate the group in the DAG
+        # Instantiate the group (call the function)
         app_group()
