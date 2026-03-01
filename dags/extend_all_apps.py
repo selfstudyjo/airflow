@@ -1,29 +1,34 @@
 from airflow import DAG
-from airflow.decorators import task
+from airflow.decorators import task, task_group
 from datetime import datetime, timedelta
 import logging
 import os
 import requests
 from airflow.models import Variable
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# List of all app IDs you need to process
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 APP_IDS = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
-
-# API domains (fallback)
 DOMAINS = [
     "https://sfsdomains1.pythonanywhere.com",
     "https://sfsdomains2.pythonanywhere.com"
 ]
+POOL_NAME = "extend_pool"  # Create this pool with slots = 3-5
+MAX_CONCURRENT_TASKS = 5   # Airflow-wide limit for this DAG
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ------------------------------------------------------------
+# Task 1: Fetch all apps and their replicas
+# ------------------------------------------------------------
 @task
-def fetch_all_users():
+def fetch_all_apps_data():
     """
-    Fetch all users (replicas) from all apps.
-    Returns a list of dicts with username, password, app_id, app_name.
+    Fetch data for all apps and return a list of app dictionaries.
+    Each app dict contains:
+        app_id, app_name, replicas (list of {username, password})
     """
     auth_token = Variable.get("AUTH_TOKEN")
     headers = {
@@ -31,9 +36,9 @@ def fetch_all_users():
         'Content-Type': 'application/json'
     }
 
-    all_users = []
+    apps_data = []
     for app_id in APP_IDS:
-        app_users = []
+        app_info = None
         for domain in DOMAINS:
             url = f"{domain}/apps/{app_id}"
             try:
@@ -41,30 +46,43 @@ def fetch_all_users():
                 resp = requests.get(url, headers=headers, timeout=30)
                 resp.raise_for_status()
                 data = resp.json()
-                app_name = data.get('app_name', f'app_{app_id}')
-                for replica in data.get('replicas', []):
-                    all_users.append({
-                        'username': replica['replica_username'],
-                        'password': replica['replica_password'],
-                        'app_id': app_id,
-                        'app_name': app_name
-                    })
-                logger.info(f"Found {len(data.get('replicas', []))} users for app {app_id}")
+                app_info = {
+                    'app_id': app_id,
+                    'app_name': data.get('app_name', f'App_{app_id}'),
+                    'replicas': [
+                        {
+                            'username': rep['replica_username'],
+                            'password': rep['replica_password']
+                        }
+                        for rep in data.get('replicas', [])
+                    ]
+                }
+                logger.info(f"App {app_id}: {len(app_info['replicas'])} replicas")
                 break  # Success, exit domain loop
             except Exception as e:
                 logger.warning(f"Failed to fetch from {url}: {e}")
                 continue
-        # If both domains fail, we just skip this app (log error)
-        if not app_users:
+        if app_info is None:
             logger.error(f"Could not fetch data for app {app_id} from any domain")
-    logger.info(f"Total users to process: {len(all_users)}")
-    return all_users
+            # Still add an entry with empty replicas to keep the list
+            app_info = {
+                'app_id': app_id,
+                'app_name': f'App_{app_id} (unavailable)',
+                'replicas': []
+            }
+        apps_data.append(app_info)
 
-@task(pool='extend_pool')
-def extend_user(user_info):
+    logger.info(f"Total apps fetched: {len(apps_data)}")
+    return apps_data
+
+
+# ------------------------------------------------------------
+# Task: Extend a single replica (the actual Selenium work)
+# ------------------------------------------------------------
+@task(pool=POOL_NAME)
+def extend_replica(replica: dict, app_name: str):
     """
-    Perform the web app extension for a single user.
-    Uses Selenium (Firefox headless) to log in and click the extend button.
+    Perform the web app extension for one replica.
     """
     import time
     from selenium import webdriver
@@ -75,12 +93,10 @@ def extend_user(user_info):
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import TimeoutException
 
-    username = user_info['username']
-    password = user_info['password']
-    app_name = user_info.get('app_name', 'unknown')
-    logger.info(f"Starting extension for user {username} (app: {app_name})")
+    username = replica['username']
+    password = replica['password']
+    logger.info(f"Starting extension for {username} (app: {app_name})")
 
-    # Helper to clear browser data
     def clear_browser_data(driver):
         try:
             driver.delete_all_cookies()
@@ -90,7 +106,6 @@ def extend_user(user_info):
         except Exception as e:
             logger.warning(f"Could not clear browser data: {e}")
 
-    # Configure Firefox
     firefox_options = FirefoxOptions()
     firefox_options.add_argument('--headless')
     firefox_options.add_argument('--no-sandbox')
@@ -123,7 +138,6 @@ def extend_user(user_info):
         )
         login_button.click()
 
-        # Wait for login to complete
         WebDriverWait(driver, 20).until(
             EC.any_of(
                 EC.presence_of_element_located((By.XPATH, f'//a[contains(@href, "/user/{username}/")]')),
@@ -131,7 +145,7 @@ def extend_user(user_info):
                 EC.url_contains("/user/")
             )
         )
-        logger.info(f"Login successful")
+        logger.info("Login successful")
 
         # --- Go to web apps page ---
         driver.get(f"https://www.pythonanywhere.com/user/{username}/webapps/")
@@ -141,7 +155,6 @@ def extend_user(user_info):
             EC.presence_of_element_located((By.TAG_NAME, 'body'))
         )
 
-        # Check if user has any web apps
         if "You haven't created any web apps" in driver.page_source:
             logger.warning(f"User {username} has no web apps. Skipping.")
             return {"status": "no_webapps", "username": username}
@@ -179,13 +192,11 @@ def extend_user(user_info):
                     f.write(driver.page_source)
                 raise Exception(f"Extend button not found for {username}")
 
-        # Click the button
         driver.execute_script("arguments[0].scrollIntoView(true);", extend_button)
         time.sleep(1)
         extend_button.click()
         logger.info("Extend button clicked")
 
-        # Wait for success indicator
         try:
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.XPATH, '//div[contains(@class, "alert-success")]'))
@@ -209,8 +220,33 @@ def extend_user(user_info):
         if driver:
             driver.quit()
 
+
 # ------------------------------------------------------------
-# DAG definition
+# Task Group: Process one app (all its replicas)
+# ------------------------------------------------------------
+@task_group(group_id="process_app", prefix_group_id=False)
+def process_app(app_dict):
+    """
+    For a given app, create one child task per replica.
+    The group will be named after the app (app_name) in the UI.
+    """
+    app_name = app_dict['app_name']
+    replicas = app_dict['replicas']
+
+    # If no replicas, we still create a dummy task to show the group
+    if not replicas:
+        @task(task_id="no_replicas")
+        def no_op():
+            logger.info(f"App {app_name} has no replicas.")
+        no_op()
+        return
+
+    # Expand the extend_replica task over all replicas
+    extend_replica.partial(app_name=app_name).expand(replica=replicas)
+
+
+# ------------------------------------------------------------
+# DAG Definition
 # ------------------------------------------------------------
 default_args = {
     'owner': 'admin',
@@ -221,17 +257,18 @@ default_args = {
 }
 
 with DAG(
-    dag_id='extend_all_apps',
+    dag_id='extend_all_apps_professional',
     default_args=default_args,
-    description='Extend all PythonAnywhere web apps for all users across all apps',
+    description='Extend all PythonAnywhere web apps – one group per app',
     schedule_interval=timedelta(weeks=1),
     catchup=False,
-    tags=['pythonanywhere', 'bulk'],
+    tags=['pythonanywhere', 'professional'],
+    max_active_tasks=MAX_CONCURRENT_TASKS,   # Global limit for this DAG
 ) as dag:
 
-    # First, fetch all users from all apps
-    all_users = fetch_all_users()
+    # Fetch all apps data first
+    apps_data = fetch_all_apps_data()
 
-    # Then, for each user, run the extension task with limited concurrency
-    # The pool 'extend_pool' must be created separately (recommended size = 3)
-    extend_user.expand(user_info=all_users)
+    # For each app, create a task group (dynamically)
+    # Using .expand() on the task group will create one group per app.
+    process_app.expand(app_dict=apps_data)
