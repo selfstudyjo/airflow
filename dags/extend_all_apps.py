@@ -1,6 +1,6 @@
 from airflow import DAG
-from airflow.decorators import task
-from airflow.utils.helpers import chain
+from airflow.decorators import task, task_group
+from airflow.operators.dummy import DummyOperator
 from datetime import datetime, timedelta
 import logging
 import os
@@ -35,7 +35,7 @@ DOMAINS = [
     "https://sfsdomains2.pythonanywhere.com"
 ]
 
-# Control concurrency: at most 1 task runs at a time (sequential)
+# Force sequential execution: only one task runs at a time
 MAX_CONCURRENT_TASKS = 1
 
 logging.basicConfig(level=logging.INFO)
@@ -238,75 +238,36 @@ with DAG(
     schedule_interval=timedelta(weeks=1),
     catchup=False,
     tags=['pythonanywhere', 'sequential'],
-    max_active_tasks=MAX_CONCURRENT_TASKS,   # Ensures only one task runs at a time globally
+    max_active_tasks=MAX_CONCURRENT_TASKS,
     max_active_runs=1,
 ) as dag:
 
-    # We'll build the task chain manually
-    previous_app_last_task = None
+    # This will hold the last task of the previous app group
+    prev_group_last = None
 
     for app_id in APP_IDS:
         app_name = APP_NAMES.get(app_id, f"App_{app_id}")
+        # Sanitize group_id
+        safe_name = app_name.replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '')
+        group_id = f"app_{app_id}_{safe_name}"
 
-        # Task to fetch replicas for this app
-        fetch_task = fetch_replicas(app_id)
-
-        # We need to create a chain of extend tasks based on the output of fetch_task
-        # But fetch_task returns a list; we'll use a dynamic approach: we create a task that expands,
-        # but to ensure sequential we can't use expand. Instead, we'll create a PythonOperator that loops
-        # over replicas sequentially, but that would hide individual task visibility.
-        #
-        # Alternative: Use task mapping but with depends_on_past to force sequential? Not possible.
-        #
-        # The clean way: create a separate task group per app with a chain of individual tasks.
-        # Since we don't know the number of replicas at DAG creation time, we must use dynamic task mapping.
-        # But the user wants tasks to run one by one, not in parallel. With dynamic mapping, we can control
-        # parallelism via max_active_tasks=1, which will cause mapped tasks to run sequentially (one at a time)
-        # but they will still be created as independent tasks. However, they could run out of order if multiple
-        # are queued? With max_active_tasks=1, only one task from the entire DAG runs at a time, so they will
-        # execute one after another, but the order might be arbitrary if multiple are ready simultaneously.
-        #
-        # To enforce order, we need to chain them. But with mapping, we cannot chain individual mapped instances.
-        #
-        # A simpler approach: use a loop to create individual tasks for each replica, and set dependencies
-        # between them. To do that, we need the list of replicas at DAG creation time, which we don't have.
-        #
-        # Therefore, we'll accept that with max_active_tasks=1, the mapped tasks will run one at a time,
-        # but they may not respect the original order of the list. To ensure order, we can sort the replicas
-        # by username or something, but that doesn't guarantee execution order because Airflow's scheduler
-        # may pick any ready task. However, with max_active_tasks=1 and a single DAG run, tasks will be
-        # executed in the order they are scheduled, which is typically the order they were created.
-        # When using expand, the mapped tasks are created in the order of the input list, and the scheduler
-        # will usually process them in that order. So with max_active_tasks=1, they will run sequentially
-        # in list order.
-        #
-        # So we can keep the mapping and rely on max_active_tasks=1 to achieve sequential execution.
-        #
-        # For app-level sequential, we need to chain the fetch task of each app after the last extend task
-        # of the previous app. We can do this by storing the last task of each app group.
-
-        # Create a task group for this app
-        @task_group(group_id=f"app_{app_id}_{app_name.replace(' ', '_')}")
+        @task_group(group_id=group_id)
         def app_group(app_id=app_id, app_name=app_name):
-            # Fetch replicas
+            # Fetch replicas for this app
             replicas = fetch_replicas(app_id)
-            # Create mapped extend tasks
+
+            # Create mapped extend tasks (they will run sequentially because max_active_tasks=1)
             extend_tasks = extend_replica.partial(app_name=app_name).expand(replica=replicas)
-            # We need to chain: replicas -> extend_tasks (but the mapping already sets that dependency)
-            # To ensure the next app starts after all extend_tasks of this app finish, we need to set
-            # the last extend task as the dependency for the next app's fetch.
-            # We can capture the last task in the mapped set by using the output of the mapping.
-            # The mapping returns a list of task instances; we can use the last element as a dependency.
-            # But at DAG definition time, we don't have the actual instances. We need to use a separate task
-            # that waits for all extend tasks, e.g., an empty task that depends on all of them.
-            from airflow.operators.dummy import DummyOperator
-            all_done = DummyOperator(task_id=f"all_extend_done_{app_id}")
+
+            # Dummy task to mark completion of this app's extensions
+            all_done = DummyOperator(task_id=f"all_extend_done")
             all_done.set_upstream(extend_tasks)
-            return all_done  # Return the dummy task so we can chain to next app
+            return all_done
 
-        group_last_task = app_group()
+        # Instantiate the group
+        group_last = app_group()
 
-        # Chain apps: the previous app's last task -> this app's fetch task (which is inside the group)
-        if previous_app_last_task:
-            previous_app_last_task >> group_last_task
-        previous_app_last_task = group_last_task
+        # Chain: previous app's last dummy -> this app's group
+        if prev_group_last:
+            prev_group_last >> group_last
+        prev_group_last = group_last
