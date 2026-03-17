@@ -238,7 +238,7 @@ with DAG(
     schedule_interval=timedelta(weeks=1),
     catchup=False,
     tags=['pythonanywhere', 'sequential'],
-    max_active_tasks=MAX_CONCURRENT_TASKS,
+    max_active_tasks=MAX_CONCURRENT_TASKS,   # Ensures only one task runs at any time
     max_active_runs=1,
 ) as dag:
 
@@ -256,7 +256,7 @@ with DAG(
             # Fetch replicas for this app
             replicas = fetch_replicas(app_id)
 
-            # Create mapped extend tasks (they will run sequentially because max_active_tasks=1)
+            # Create mapped extend tasks – they will run sequentially because max_active_tasks=1
             extend_tasks = extend_replica.partial(app_name=app_name).expand(replica=replicas)
 
             # Dummy task to mark completion of this app's extensions
