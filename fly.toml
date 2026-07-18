@@ -1,4 +1,4 @@
-app = "airflow-selfstudyjo"
+app = "airflow-i6nkzw"
 primary_region = "sjc"
 
 [build]
@@ -23,11 +23,11 @@ primary_region = "sjc"
   [checks.health]
     port = 8080
     type = "http"
-    interval = "60s"
-    timeout = "15s"
-    path = "/health"
-    grace_period = "180s"
+    interval = "120s"
+    timeout = "30s"
+    path = "/"
+    grace_period = "600s"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = 256
+  memory = 512
