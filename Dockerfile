@@ -2,44 +2,47 @@ FROM python:3.11-slim
 
 USER root
 
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libpq-dev curl git \
+    gcc libpq-dev curl git nano htop procps \
     firefox-esr xvfb \
     libgtk-3-0 libdbus-glib-1-2 libxt6 libx11-xcb1 \
-    fonts-liberation libasound2 wget procps dos2unix \
+    fonts-liberation libasound2 wget \
+    postgresql postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
+# Firefox symlink
 RUN ln -sf /usr/bin/firefox-esr /usr/bin/firefox
 
+# Geckodriver
 RUN wget -q "https://github.com/mozilla/geckodriver/releases/download/v0.35.0/geckodriver-v0.35.0-linux64.tar.gz" \
     -O /tmp/geckodriver.tar.gz && \
     tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin/ && \
     chmod +x /usr/local/bin/geckodriver && \
     rm /tmp/geckodriver.tar.gz
 
+# Create airflow user and directories
 RUN useradd -m -s /bin/bash airflow && \
     mkdir -p /opt/airflow/dags /opt/airflow/logs /opt/airflow/plugins && \
     chown -R airflow:airflow /opt/airflow
 
+# Switch to airflow user for pip installs
 USER airflow
 ENV AIRFLOW_HOME=/opt/airflow
 ENV PATH="/home/airflow/.local/bin:${PATH}"
 
+# Install Airflow
 RUN pip install --no-cache-dir --user \
     "apache-airflow==2.10.5" \
     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt"
 
+# Install extra packages
 RUN pip install --no-cache-dir --user \
-    selenium==4.27.1 requests psycopg2-binary
+    selenium==4.27.1 \
+    requests \
+    psycopg2-binary
 
+# Copy DAGs
 COPY --chown=airflow:airflow dags/ /opt/airflow/dags/
-COPY --chown=airflow:airflow start.sh /opt/airflow/start.sh
 
-USER root
-RUN dos2unix /opt/airflow/start.sh && chmod +x /opt/airflow/start.sh
-
-USER airflow
 WORKDIR /opt/airflow
-EXPOSE 8080
-
-CMD ["/opt/airflow/start.sh"]
