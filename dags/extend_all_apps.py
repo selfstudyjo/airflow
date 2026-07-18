@@ -1,58 +1,72 @@
+"""
+Dynamic DAG generator: one DAG per PythonAnywhere app.
+All extend_replica tasks share a global pool (reload_apps_pool, 3 slots),
+so only 3 tasks across ALL these DAGs run simultaneously.
+"""
+
 from airflow import DAG
-from airflow.decorators import task, task_group
+from airflow.decorators import task
 from airflow.operators.dummy import DummyOperator
+from airflow.models import Variable
 from datetime import datetime, timedelta
 import logging
-import os
 import requests
-from airflow.models import Variable
 
 # ------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------
-APP_IDS = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
-APP_NAMES = {
-    8: "SelfStudy Domains",
-    9: "SelfStudy Chat",
-    10: "All Chat",
-    11: "Lab",
-    12: "Live Course",
-    13: "User Profile",
-    14: "SelfStudy OTP",
-    15: "SelfStudy Auth",
-    16: "Notifications",
-    17: "Runbooks",
-    18: "SelfStudy Media",
-    19: "SelfStudy Course",
-    20: "Exam",
-    21: "Proctor",
-    22: "Subscriptions",
-    23: "Payment",
-    24: "Certificate"
-}
+MAIN_SERVER_URL = "https://sfsdomains1.pythonanywhere.com"
 DOMAINS = [
     "https://sfsdomains1.pythonanywhere.com",
-    "https://sfsdomains2.pythonanywhere.com"
+    "https://sfsdomains2.pythonanywhere.com",
 ]
 
-# Force sequential execution: only one task runs at a time
-MAX_CONCURRENT_TASKS = 1
+GLOBAL_POOL = "reload_apps_pool"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------
-# Task: Fetch replicas for a given app
-# ------------------------------------------------------------
+
+def get_apps_from_server():
+    """Fetch all apps from the main server (DAG-parse time)."""
+    try:
+        auth_token = Variable.get("AUTH_TOKEN")
+    except Exception as e:
+        logger.error(f"AUTH_TOKEN variable not set: {e}")
+        return []
+
+    headers = {
+        "Authorization": f"Token {auth_token}",
+        "Content-Type": "application/json",
+    }
+    url = f"{MAIN_SERVER_URL}/apps/"
+    try:
+        logger.info(f"Fetching apps from {url}")
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        return [{"id": a["id"], "name": a["app_name"]} for a in resp.json()]
+    except Exception as e:
+        logger.error(f"Failed to fetch apps: {e}")
+        return []
+
+
+def sanitize(name: str) -> str:
+    return (
+        name.replace(" ", "_")
+            .replace("-", "_")
+            .replace("(", "")
+            .replace(")", "")
+            .replace(".", "_")
+            .replace("/", "_")
+    )
+
+
 @task
 def fetch_replicas(app_id: int):
-    """
-    Fetch replicas for a specific app. Returns list of dicts with username, password.
-    """
     auth_token = Variable.get("AUTH_TOKEN")
     headers = {
-        'Authorization': f'Token {auth_token}',
-        'Content-Type': 'application/json'
+        "Authorization": f"Token {auth_token}",
+        "Content-Type": "application/json",
     }
     for domain in DOMAINS:
         url = f"{domain}/apps/{app_id}"
@@ -62,28 +76,21 @@ def fetch_replicas(app_id: int):
             resp.raise_for_status()
             data = resp.json()
             replicas = [
-                {
-                    'username': rep['replica_username'],
-                    'password': rep['replica_password']
-                }
-                for rep in data.get('replicas', [])
+                {"username": r["replica_username"],
+                 "password": r["replica_password"]}
+                for r in data.get("replicas", [])
             ]
             logger.info(f"App {app_id}: {len(replicas)} replicas")
             return replicas
         except Exception as e:
             logger.warning(f"Failed to fetch from {url}: {e}")
             continue
-    logger.error(f"Could not fetch data for app {app_id} from any domain")
-    return []  # return empty list so no tasks are created
+    logger.error(f"No data for app {app_id}")
+    return []
 
-# ------------------------------------------------------------
-# Task: Extend a single replica (the actual Selenium work)
-# ------------------------------------------------------------
-@task
+
+@task(pool=GLOBAL_POOL, pool_slots=1)
 def extend_replica(replica: dict, app_name: str):
-    """
-    Perform the web app extension for one replica.
-    """
     import time
     from selenium import webdriver
     from selenium.webdriver.firefox.service import Service as FirefoxService
@@ -93,181 +100,144 @@ def extend_replica(replica: dict, app_name: str):
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import TimeoutException
 
-    username = replica['username']
-    password = replica['password']
+    username = replica["username"]
+    password = replica["password"]
     logger.info(f"Starting extension for {username} (app: {app_name})")
 
-    def clear_browser_data(driver):
-        try:
-            driver.delete_all_cookies()
-            driver.execute_script("window.localStorage.clear();")
-            driver.execute_script("window.sessionStorage.clear();")
-            logger.info("Browser data cleared")
-        except Exception as e:
-            logger.warning(f"Could not clear browser data: {e}")
-
-    firefox_options = FirefoxOptions()
-    firefox_options.add_argument('--headless')
-    firefox_options.add_argument('--no-sandbox')
-    firefox_options.add_argument('--disable-dev-shm-usage')
-    firefox_options.set_preference("general.useragent.override",
-                                   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0")
+    opts = FirefoxOptions()
+    opts.add_argument("--headless")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.set_preference(
+        "general.useragent.override",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    )
 
     service = FirefoxService(executable_path="/usr/local/bin/geckodriver")
-    driver = webdriver.Firefox(service=service, options=firefox_options)
+    driver = webdriver.Firefox(service=service, options=opts)
     driver.set_window_size(1920, 1080)
 
     try:
-        # --- Login ---
-        clear_browser_data(driver)
+        driver.delete_all_cookies()
         driver.get("https://www.pythonanywhere.com/login/?next=/")
-        logger.info(f"Login page loaded, title: {driver.title}")
 
-        username_field = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, 'id_auth-username'))
+        u = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "id_auth-username"))
         )
-        username_field.clear()
-        username_field.send_keys(username)
+        u.clear(); u.send_keys(username)
 
-        password_field = driver.find_element(By.ID, 'id_auth-password')
-        password_field.clear()
-        password_field.send_keys(password)
+        p = driver.find_element(By.ID, "id_auth-password")
+        p.clear(); p.send_keys(password)
 
-        login_button = WebDriverWait(driver, 20).until(
-            EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "Log in")]'))
-        )
-        login_button.click()
+        WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable(
+                (By.XPATH, '//button[contains(text(), "Log in")]')
+            )
+        ).click()
 
         WebDriverWait(driver, 20).until(
             EC.any_of(
-                EC.presence_of_element_located((By.XPATH, f'//a[contains(@href, "/user/{username}/")]')),
-                EC.presence_of_element_located((By.XPATH, f'//span[contains(text(), "{username}")]')),
-                EC.url_contains("/user/")
+                EC.presence_of_element_located(
+                    (By.XPATH, f'//a[contains(@href, "/user/{username}/")]')),
+                EC.url_contains("/user/"),
             )
         )
-        logger.info("Login successful")
+        logger.info("Login OK")
 
-        # --- Go to web apps page ---
         driver.get(f"https://www.pythonanywhere.com/user/{username}/webapps/")
-        logger.info(f"Web apps page loaded, title: {driver.title}")
-
         WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.TAG_NAME, 'body'))
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
         )
 
         if "You haven't created any web apps" in driver.page_source:
-            logger.warning(f"User {username} has no web apps. Skipping.")
             return {"status": "no_webapps", "username": username}
 
-        # --- Find and click extend button ---
-        extend_selectors = [
+        selectors = [
             '//input[@type="submit" and contains(@value, "Run until")]',
             '//button[contains(text(), "Run until")]',
             '//input[contains(@value, "Run until")]',
             '//input[@type="submit" and contains(@value, "Extend")]',
             '//button[contains(text(), "Extend")]',
-            '//form//input[@type="submit"][contains(@value, "Run")]'
         ]
-
-        extend_button = None
-        for selector in extend_selectors:
+        btn = None
+        for sel in selectors:
             try:
-                extend_button = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, selector))
+                btn = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, sel))
                 )
-                logger.info(f"Found extend button with selector: {selector}")
                 break
             except TimeoutException:
                 continue
 
-        if not extend_button:
-            page_text = driver.page_source
-            if "Your web app will expire on" in page_text or "expires on" in page_text:
-                logger.info(f"App not due for extension – no button found.")
+        if not btn:
+            if "expires on" in driver.page_source:
                 return {"status": "not_due", "username": username}
-            else:
-                logger.error(f"No extend button found and no expiration message.")
-                driver.save_screenshot(f"/tmp/no_button_{username}.png")
-                with open(f"/tmp/page_{username}.html", "w") as f:
-                    f.write(driver.page_source)
-                raise Exception(f"Extend button not found for {username}")
+            raise Exception(f"Extend button not found for {username}")
 
-        driver.execute_script("arguments[0].scrollIntoView(true);", extend_button)
+        driver.execute_script("arguments[0].scrollIntoView(true);", btn)
         time.sleep(1)
-        extend_button.click()
+        btn.click()
         logger.info("Extend button clicked")
 
         try:
             WebDriverWait(driver, 15).until(
-                EC.presence_of_element_located((By.XPATH, '//div[contains(@class, "alert-success")]'))
+                EC.presence_of_element_located(
+                    (By.XPATH, '//div[contains(@class, "alert-success")]'))
             )
-            logger.info("Extension confirmed (success message)")
         except TimeoutException:
             time.sleep(5)
-            logger.info("Extension likely completed (no success message)")
 
         return {"status": "extended", "username": username}
 
     except Exception as e:
-        logger.error(f"Error processing user {username}: {e}")
-        if driver:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            driver.save_screenshot(f"/tmp/error_{username}_{timestamp}.png")
-            with open(f"/tmp/page_{username}_{timestamp}.html", "w") as f:
-                f.write(driver.page_source)
+        logger.error(f"Error for {username}: {e}")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            driver.save_screenshot(f"/tmp/error_{username}_{ts}.png")
+        except Exception:
+            pass
         raise
     finally:
-        if driver:
+        try:
             driver.quit()
+        except Exception:
+            pass
 
-# ------------------------------------------------------------
-# DAG Definition
-# ------------------------------------------------------------
-default_args = {
-    'owner': 'admin',
-    'depends_on_past': False,
-    'start_date': datetime(2025, 1, 1),
-    'retries': 2,
-    'retry_delay': timedelta(minutes=5),
-}
 
-with DAG(
-    dag_id='extend_all_apps_professional',
-    default_args=default_args,
-    description='Extend all PythonAnywhere web apps – sequentially by app and by replica',
-    schedule_interval=timedelta(weeks=1),
-    catchup=False,
-    tags=['pythonanywhere', 'sequential'],
-    max_active_tasks=MAX_CONCURRENT_TASKS,   # Ensures only one task runs at any time
-    max_active_runs=1,
-) as dag:
+def build_dag(app_id: int, app_name: str) -> DAG:
+    safe = sanitize(app_name)
+    dag_id = f"reload_app_{app_id}_{safe}"
 
-    # This will hold the last task of the previous app group
-    prev_group_last = None
+    default_args = {
+        "owner": "admin",
+        "depends_on_past": False,
+        "start_date": datetime(2025, 1, 1),
+        "retries": 2,
+        "retry_delay": timedelta(minutes=5),
+    }
 
-    for app_id in APP_IDS:
-        app_name = APP_NAMES.get(app_id, f"App_{app_id}")
-        # Sanitize group_id
-        safe_name = app_name.replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '')
-        group_id = f"app_{app_id}_{safe_name}"
+    with DAG(
+        dag_id=dag_id,
+        default_args=default_args,
+        description=f"Extend PythonAnywhere web app: {app_name}",
+        schedule_interval=timedelta(weeks=1),
+        catchup=False,
+        tags=["pythonanywhere", "reload_app"],
+        max_active_runs=1,
+    ) as dag:
+        replicas = fetch_replicas(app_id)
+        extends = extend_replica.partial(app_name=app_name).expand(
+            replica=replicas
+        )
+        done = DummyOperator(task_id="all_extend_done")
+        extends >> done
+    return dag
 
-        @task_group(group_id=group_id)
-        def app_group(app_id=app_id, app_name=app_name):
-            # Fetch replicas for this app
-            replicas = fetch_replicas(app_id)
 
-            # Create mapped extend tasks – they will run sequentially because max_active_tasks=1
-            extend_tasks = extend_replica.partial(app_name=app_name).expand(replica=replicas)
+# Generate DAGs at parse time
+APPS = get_apps_from_server()
+logger.info(f"DAG parse: generating {len(APPS)} DAGs")
 
-            # Dummy task to mark completion of this app's extensions
-            all_done = DummyOperator(task_id=f"all_extend_done")
-            all_done.set_upstream(extend_tasks)
-            return all_done
-
-        # Instantiate the group
-        group_last = app_group()
-
-        # Chain: previous app's last dummy -> this app's group
-        if prev_group_last:
-            prev_group_last >> group_last
-        prev_group_last = group_last
+for _app in APPS:
+    _dag = build_dag(_app["id"], _app["name"])
+    globals()[_dag.dag_id] = _dag
