@@ -8,7 +8,6 @@ echo "========================================"
 echo "  Starting Airflow on Fly.io"
 echo "========================================"
 
-# ─── Configure Airflow ───
 export AIRFLOW__CORE__EXECUTOR=LocalExecutor
 export AIRFLOW__CORE__SQL_ALCHEMY_CONN="sqlite:////opt/airflow/airflow.db"
 export AIRFLOW__CORE__LOAD_EXAMPLES=False
@@ -27,11 +26,9 @@ export AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT=300
 export AIRFLOW__WEBSERVER__BASE_URL=https://airflow-i6nkzw.fly.dev
 export AIRFLOW__API__AUTH_BACKENDS=airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
 
-# ─── Initialize Database ───
 echo "[init] Migrating database..."
 airflow db migrate 2>&1 | tail -3
 
-# ─── Create admin user ───
 echo "[init] Creating admin user..."
 airflow users create \
     --username admin \
@@ -41,21 +38,17 @@ airflow users create \
     --email admin@example.com \
     --password admin 2>/dev/null || echo "[init] Admin already exists"
 
-# ─── Set Variables ───
 if [ -n "$AUTH_TOKEN" ]; then
     airflow variables set AUTH_TOKEN "$AUTH_TOKEN" 2>/dev/null || true
     echo "[init] AUTH_TOKEN set"
 else
-    echo "[init] WARNING: AUTH_TOKEN not configured"
-    echo "[init] Set it later: fly secrets set AUTH_TOKEN=your_token"
+    echo "[init] WARNING: AUTH_TOKEN not set"
 fi
 
-# ─── Create Pools ───
 airflow pools set reload_apps_pool 3 "Selenium extend tasks" 2>/dev/null || true
 airflow pools set ping_apps_pool 5 "HTTP ping tasks" 2>/dev/null || true
 echo "[init] Pools created"
 
-# ─── DAG sync from GitHub (background) ───
 (
     while true; do
         sleep 300
@@ -71,7 +64,6 @@ echo "[init] Pools created"
     done
 ) &
 
-# ─── Log cleanup (background) ───
 (
     while true; do
         sleep 3600
@@ -80,19 +72,15 @@ echo "[init] Pools created"
     done
 ) &
 
-# ─── Start Scheduler (background) ───
 echo "[init] Starting scheduler..."
 airflow scheduler &
 
 sleep 5
 
-# ─── Start Webserver (foreground) ───
-echo ""
 echo "========================================="
 echo "  Airflow is ready!"
 echo "  Username: admin"
 echo "  Password: admin"
 echo "========================================="
-echo ""
 
-exec airflow webserver --port 8080
+exec airflow webserver --port 8080 --hostname 0.0.0.0

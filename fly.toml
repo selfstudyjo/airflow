@@ -22,10 +22,9 @@ primary_region = "sjc"
 [checks]
   [checks.health]
     port = 8080
-    type = "http"
+    type = "tcp"
     interval = "120s"
     timeout = "30s"
-    path = "/"
     grace_period = "600s"
 
 [[vm]]

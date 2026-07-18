@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libpq-dev curl git \
     firefox-esr xvfb \
     libgtk-3-0 libdbus-glib-1-2 libxt6 libx11-xcb1 \
-    fonts-liberation libasound2 wget procps \
+    fonts-liberation libasound2 wget procps dos2unix \
     && rm -rf /var/lib/apt/lists/*
 
 RUN ln -sf /usr/bin/firefox-esr /usr/bin/firefox
@@ -34,8 +34,11 @@ RUN pip install --no-cache-dir --user \
 
 COPY --chown=airflow:airflow dags/ /opt/airflow/dags/
 COPY --chown=airflow:airflow start.sh /opt/airflow/start.sh
-RUN chmod +x /opt/airflow/start.sh
 
+USER root
+RUN dos2unix /opt/airflow/start.sh && chmod +x /opt/airflow/start.sh
+
+USER airflow
 WORKDIR /opt/airflow
 EXPOSE 8080
 
